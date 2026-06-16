@@ -6,92 +6,95 @@ import { sliceFileIntoChunks } from '../utils/chunker';
 import { useSignaling } from '../hooks/useSignaling';
 import { useWebRTC } from '../hooks/useWebRTC';
 
-function HomePage() {
-    const [file, setFile] = useState<File | null>(null);
-    const [passPhrase, setPassPhrase] = useState("");
-    const [fileHashInput, setFileHashInput] = useState("");
+export default function HomePage() {
+    const [file, setFile]                     = useState<File | null>(null);
+    const [passPhrase, setPassPhrase]         = useState("");
+    const [fileHashInput, setFileHashInput]   = useState("");
     const [downloadPassword, setDownloadPassword] = useState("");
-    const [downloadUrl, setDownloadUrl] = useState("");
-    const [isProcessing, setIsProcessing] = useState(false);
+    const [downloadUrl, setDownloadUrl]       = useState("");
+    const [isProcessing, setIsProcessing]     = useState(false);
 
-    // Refs so async WebRTC callbacks always see the latest values (no stale closures)
-    const passPhraseRef = useRef<string>("");
+    // Refs that async callbacks read — prevents stale closure bugs
+    const passPhraseRef       = useRef<string>("");
     const downloadPasswordRef = useRef<string>("");
-    const activeFileHashRef = useRef<string>("");
-    const uploadSaltRef = useRef<Uint8Array | null>(null); // salt used to encrypt DB chunks
-    const targetPeerIdRef = useRef<string>("");
+    const activeFileHashRef   = useRef<string>("");
+    const uploadSaltRef       = useRef<Uint8Array | null>(null);
 
-    useEffect(() => { passPhraseRef.current = passPhrase; }, [passPhrase]);
+    useEffect(() => { passPhraseRef.current       = passPhrase;       }, [passPhrase]);
     useEffect(() => { downloadPasswordRef.current = downloadPassword; }, [downloadPassword]);
 
-    // ── Signaling ─────────────────────────────────────────────────────────────
-    const {
-        myConnectionId,
-        targetPeerId,
-        setTargetPeerId,
-        statusMessage,
-        setStatusMessage,
-        registerFile,
-        lookupFile,
-        socketRef,
-        hashIdText
-    } = useSignaling({ onSignalReceived: handleIncomingSignalEvent });
+    // ── Hooks ─────────────────────────────────────────────────────────────────
 
-    useEffect(() => {
-        targetPeerIdRef.current = targetPeerId;
-    }, [targetPeerId]);
+    /**
+     * onDownloaderFound: fires on the UPLOADER when the server sends DOWNLOADER_FOUND.
+     * At that point we have the downloader's socket ID and can start a WebRTC offer.
+     */
+    function onDownloaderFound(downloaderSocketId: string) {
+        const salt = uploadSaltRef.current;
+        if (!salt) {
+            console.error("onDownloaderFound: no uploadSalt — was file encrypted?");
+            return;
+        }
+        console.log(`🛰️  Downloader ${downloaderSocketId} found — starting sender`);
+        initializeSender(
+            activeFileHashRef.current,
+            passPhraseRef.current,
+            salt,
+            downloaderSocketId
+        );
+    }
 
-    // ── WebRTC — single instance, dual internal PeerConnections ───────────────
-    const {
-        initializeSender,
-        initializeReceiver,
-        handleIncomingSignal,
-        receivedChunks
-    } = useWebRTC({ socketRef, targetPeerIdRef, setStatusMessage });
-
-    // ── Signal dispatcher ─────────────────────────────────────────────────────
-    function handleIncomingSignalEvent(senderId: string, signalData: any) {
-        setTargetPeerId(senderId);
-        targetPeerIdRef.current = senderId;
-
+    /**
+     * onSignalReceived: fires on BOTH machines for WebRTC signaling packets.
+     *   - offer   → we are the DOWNLOADER → call initializeReceiver
+     *   - answer/candidate → we are the UPLOADER → call handleIncomingSignal
+     */
+    function onSignalReceived(senderId: string, signalData: any) {
         if (signalData.type === 'offer') {
-            console.log("📥 Offer received — initializing receiver...");
+            console.log(`📥 Offer from ${senderId} — initializing receiver`);
             initializeReceiver(signalData.sdp, downloadPasswordRef.current, senderId);
         } else {
-            // 'answer' goes to senderPC; 'candidate' is routed by role tag — both
-            // handled inside handleIncomingSignal via the separate PC refs.
             handleIncomingSignal(signalData);
         }
     }
 
-    // ── Auto-trigger sender when a downloader discovers our file ──────────────
-    // Passes the uploadSalt so initializeSender sends the SAME salt to the receiver
-    // that was used to encrypt the DB chunks — ensuring key derivation matches.
-    useEffect(() => {
-        if (!targetPeerId || !activeFileHashRef.current || !uploadSaltRef.current) return;
-        console.log(`🛰️ Peer found (${targetPeerId}). Starting sender...`);
-        initializeSender(activeFileHashRef.current, passPhraseRef.current, uploadSaltRef.current);
-    }, [targetPeerId]); // eslint-disable-line react-hooks/exhaustive-deps
+    const {
+        myConnectionId,
+        statusMessage,
+        setStatusMessage,
+        registerFile,
+        lookupFile,
+        sendSignal,       // ← owned by useSignaling, passed to useWebRTC
+        hashIdText,
+    } = useSignaling({ onSignalReceived, onDownloaderFound });
 
-    // ── Assemble download URL when receiver completes ─────────────────────────
-    // Chunks are already decrypted inside useWebRTC (on __EOF__).
+    const {
+        initializeSender,
+        initializeReceiver,
+        handleIncomingSignal,
+        receivedChunks,
+    } = useWebRTC({ sendSignal, setStatusMessage });
+
+    // ── Build download URL when receiver finishes ─────────────────────────────
     useEffect(() => {
         if (receivedChunks.length === 0) return;
-        const blob = new Blob(receivedChunks.map(b => new Uint8Array(b)), {
-            type: "application/octet-stream"
-        });
+        const blob = new Blob(
+            receivedChunks.map(b => new Uint8Array(b)),
+            { type: "application/octet-stream" }
+        );
         setDownloadUrl(URL.createObjectURL(blob));
         setStatusMessage("✅ File ready! Click below to save.");
     }, [receivedChunks]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // ── Handlers ──────────────────────────────────────────────────────────────
 
-    async function generateFileHash(text: string): Promise<string> {
+    async function generateFileHash(name: string): Promise<string> {
         const buf = await crypto.subtle.digest(
             'SHA-256',
-            new TextEncoder().encode(text + Math.random() + Date.now())
+            new TextEncoder().encode(name + Math.random() + Date.now())
         );
-        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+        return Array.from(new Uint8Array(buf))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
     const handleUploadAndEncrypt = async (e: React.FormEvent) => {
@@ -105,20 +108,25 @@ function HomePage() {
             setDownloadUrl("");
             setStatusMessage("Encrypting file...");
 
-            // Generate a random salt, derive the AES key, encrypt + store chunks.
-            // We save the salt in uploadSaltRef so initializeSender can send the exact
-            // same salt to the receiver, letting it derive the matching decryption key.
+            // Generate the salt ONCE here.
+            // This same salt is stored in uploadSaltRef and later sent over the
+            // WebRTC data channel (in initializeSender) as the first unencrypted
+            // message so the receiver can derive the identical AES-GCM key.
             const salt = window.crypto.getRandomValues(new Uint8Array(16));
             uploadSaltRef.current = salt;
 
             const fileHash = await generateFileHash(file.name);
             const key = await deriveKey(passPhrase, salt);
 
+            // All DB writes are awaited inside sliceFileIntoChunks
             await sliceFileIntoChunks(file, 16384, key, fileHash);
-
             activeFileHashRef.current = fileHash;
+
+            // Tell the signaling server we're hosting this hash.
+            // When a downloader looks it up, the server sends us DOWNLOADER_FOUND
+            // and our onDownloaderFound callback fires initializeSender.
             registerFile(fileHash);
-            setStatusMessage("✅ File hosted! Share the hash with your peer.");
+            setStatusMessage("✅ Hosted! Share the hash below with your peer.");
         } catch (err) {
             console.error(err);
             setStatusMessage("Encryption failed.");
@@ -130,13 +138,15 @@ function HomePage() {
     const handleLookupAndStream = async (e: React.FormEvent) => {
         e.preventDefault();
         if (!fileHashInput || !downloadPassword) {
-            setStatusMessage("Please enter both the file hash and passphrase.");
+            setStatusMessage("Enter both the file hash and passphrase.");
             return;
         }
         try {
             setIsProcessing(true);
             setDownloadUrl("");
-            setStatusMessage("Looking up peer...");
+            // After this, everything is event-driven:
+            // server → DOWNLOADER_FOUND on uploader → offer → SIGNAL on downloader
+            // → initializeReceiver → answer → data channel → chunks → decrypt
             lookupFile(fileHashInput);
         } catch (err) {
             console.error(err);
@@ -146,6 +156,7 @@ function HomePage() {
         }
     };
 
+    // ── UI ────────────────────────────────────────────────────────────────────
     return (
         <div className='h-screen flex flex-col bg-blue-200 items-center justify-center p-4'>
             <div className='flex flex-col bg-white self-center p-3 rounded-lg shadow-md max-w-2xl w-full'>
@@ -159,10 +170,12 @@ function HomePage() {
 
                 <div className="flex flex-col md:flex-row justify-center p-5 items-stretch gap-4">
 
-                    {/* Host Panel */}
+                    {/* Uploader */}
                     <form onSubmit={handleUploadAndEncrypt}
                         className="flex flex-col flex-1 border border-gray-300 rounded p-4 justify-center gap-2">
-                        <span className="text-xs font-bold text-blue-600 uppercase tracking-wider mb-1">Host a File</span>
+                        <span className="text-xs font-bold text-blue-600 uppercase tracking-wider mb-1">
+                            Host a File
+                        </span>
                         <label htmlFor="file" className="font-medium text-sm text-gray-700">Select file</label>
                         <input type="file" id="file"
                             className='border border-gray-300 rounded p-1 text-sm w-full'
@@ -175,14 +188,16 @@ function HomePage() {
                             disabled={isProcessing} />
                         <button type="submit" disabled={isProcessing}
                             className='mt-4 bg-blue-600 text-white px-4 py-1.5 rounded font-medium hover:bg-blue-700 w-full transition disabled:bg-gray-400 text-sm'>
-                            {isProcessing ? "Processing..." : "Encrypt & Host"}
+                            {isProcessing ? "Encrypting..." : "Encrypt & Host"}
                         </button>
                     </form>
 
-                    {/* Downloader Panel */}
+                    {/* Downloader */}
                     <form onSubmit={handleLookupAndStream}
                         className="flex flex-col flex-1 border border-gray-300 rounded p-4 justify-center gap-2">
-                        <span className="text-xs font-bold text-green-600 uppercase tracking-wider mb-1">Download a File</span>
+                        <span className="text-xs font-bold text-green-600 uppercase tracking-wider mb-1">
+                            Download a File
+                        </span>
                         <label htmlFor="hashInput" className="font-medium text-sm text-gray-700">File Hash</label>
                         <input type="text" id="hashInput"
                             value={fileHashInput} onChange={(e) => setFileHashInput(e.target.value)}
@@ -195,7 +210,7 @@ function HomePage() {
                             disabled={isProcessing} />
                         <button type="submit" disabled={isProcessing}
                             className='mt-4 bg-green-600 text-white px-4 py-1.5 rounded font-medium hover:bg-green-700 w-full transition disabled:bg-gray-400 text-sm'>
-                            Connect & Download
+                            {isProcessing ? "Looking up..." : "Connect & Download"}
                         </button>
 
                         {downloadUrl && (
@@ -216,5 +231,3 @@ function HomePage() {
         </div>
     );
 }
-
-export default HomePage;

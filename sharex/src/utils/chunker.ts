@@ -53,7 +53,7 @@ export async function sliceFileIntoChunks(
         chunkIndex++;
     }
 
-    console.log(`✅ All ${chunkIndex} chunks encrypted and saved to IndexedDB.`);
+    console.log(`All ${chunkIndex} chunks encrypted and saved to IndexedDB.`);
 }
 
 /** Reassembles an array of raw decrypted ArrayBuffers into a Blob download URL. */
