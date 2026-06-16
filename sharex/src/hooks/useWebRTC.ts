@@ -3,303 +3,302 @@
 import { useRef, useState, useEffect, useCallback } from 'react';
 import { db } from '../lib/db';
 import { deriveKey } from '../utils/crypto';
+import { rtcConfig } from '../utils/webrtc';
 
 interface UseWebRTCOptions {
-    socketRef: React.MutableRefObject<WebSocket | null>;
-    targetPeerIdRef: React.MutableRefObject<string>;
+    // sendSignal comes from useSignaling — one place owns the WebSocket
+    sendSignal: (targetId: string, signalData: any) => void;
     setStatusMessage: (msg: string) => void;
 }
 
-export function useWebRTC({ socketRef, targetPeerIdRef, setStatusMessage }: UseWebRTCOptions) {
-    // FIX: Separate RTCPeerConnection refs for sender and receiver.
-    //
-    // Root cause of "setRemoteDescription called in wrong state: stable":
-    //   Previously a single peerConnectionRef was shared between both roles.
-    //   When initializeReceiver ran it overwrote the ref. Then when the sender's
-    //   'answer' arrived via handleIncomingSignal it read the ref and called
-    //   setRemoteDescription on the RECEIVER's already-stable PC instead of the
-    //   sender's PC, which correctly expected an answer in 'have-local-offer' state.
-    //
-    // Fix: senderPCRef only ever holds the sender's PC. receiverPCRef only ever
-    // holds the receiver's PC. handleIncomingSignal routes by signal type and role.
-    const senderPCRef = useRef<RTCPeerConnection | null>(null);
+export function useWebRTC({ sendSignal, setStatusMessage }: UseWebRTCOptions) {
+    // Separate RTCPeerConnection refs for each role so signals are never
+    // applied to the wrong connection (was the cause of "wrong state: stable").
+    const senderPCRef   = useRef<RTCPeerConnection | null>(null);
     const receiverPCRef = useRef<RTCPeerConnection | null>(null);
-    const dataChannelRef = useRef<RTCDataChannel | null>(null);
 
     const [receivedChunks, setReceivedChunks] = useState<ArrayBuffer[]>([]);
-    const currentFileHashRef = useRef<string>("");
 
-    // Separate ICE candidate queues — candidates can arrive for either role
-    // before the corresponding PC has a remote description set
-    const senderICEQueueRef = useRef<RTCIceCandidateInit[]>([]);
-    const receiverICEQueueRef = useRef<RTCIceCandidateInit[]>([]);
+    // ICE candidates can arrive before setRemoteDescription completes — queue them
+    const senderICEQueue   = useRef<RTCIceCandidateInit[]>([]);
+    const receiverICEQueue = useRef<RTCIceCandidateInit[]>([]);
 
-    const rtcConfig: RTCConfiguration = {
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-    };
+    // Keep sendSignal stable inside callbacks via ref
+    const sendSignalRef = useRef(sendSignal);
+    useEffect(() => { sendSignalRef.current = sendSignal; }, [sendSignal]);
 
-    const sendSignal = useCallback((signalData: any, customTargetId?: string) => {
-        const target = customTargetId || targetPeerIdRef.current;
-        if (socketRef.current?.readyState === WebSocket.OPEN && target) {
-            socketRef.current.send(JSON.stringify({
-                action: "RELAY_SIGNAL",
-                targetId: target,
-                signalData
-            }));
-        }
-    }, [socketRef, targetPeerIdRef]);
-
-    /**
-     * Parses "CHUNK:<index>:<payload>" by scanning for colons at the byte level.
-     * Avoids the previous fixed 30-byte slice which misread headers for large indices.
-     */
+    /** Parse "CHUNK:<index>:<payload>" by scanning for colons at the byte level. */
     function parseChunkPacket(buf: ArrayBuffer): { chunkIndex: number; payload: ArrayBuffer } | null {
         const view = new Uint8Array(buf);
         const colons: number[] = [];
         for (let i = 0; i < Math.min(view.length, 64); i++) {
-            if (view[i] === 58) { // ASCII ':'
-                colons.push(i);
-                if (colons.length === 2) break;
-            }
+            if (view[i] === 58) { colons.push(i); if (colons.length === 2) break; }
         }
         if (colons.length < 2) return null;
         const idx = parseInt(new TextDecoder().decode(view.slice(colons[0] + 1, colons[1])), 10);
-        if (isNaN(idx)) return null;
-        return { chunkIndex: idx, payload: buf.slice(colons[1] + 1) };
+        return isNaN(idx) ? null : { chunkIndex: idx, payload: buf.slice(colons[1] + 1) };
     }
 
+    // ── SENDER ────────────────────────────────────────────────────────────────
+
     /**
-     * SENDER: Creates an offer, opens a data channel, and on open:
-     *   1. Sends the uploadSalt (same one used to encrypt DB chunks) as the FIRST
-     *      unencrypted binary message so the receiver can derive the matching key.
-     *   2. Streams all CHUNK-framed packets from IndexedDB.
-     *   3. Sends "__EOF__".
+     * Called on the UPLOADER's machine when server sends DOWNLOADER_FOUND.
      *
-     * The uploadSalt is passed in from page.tsx where it was generated at encrypt time.
-     * This is the critical correctness requirement: both sides must derive from the
-     * same salt. Previously a fresh random salt was generated here — that produced a
-     * different key than the one used to encrypt, so decryption always failed.
+     * Salt flow:
+     *   uploadSalt was generated in page.tsx at encrypt time and stored in a ref.
+     *   We send it here as the FIRST unencrypted binary message so the receiver
+     *   can call deriveKey(passphrase, salt) and get the identical AES-GCM key.
+     *   Never generate a new salt here — that would mismatch the stored chunks.
      */
     const initializeSender = useCallback(async (
         fileHash: string,
         passphrase: string,
-        uploadSalt: Uint8Array          // ← same salt used during encryption
+        uploadSalt: Uint8Array,
+        targetId: string          // downloaderSocketId from DOWNLOADER_FOUND
     ) => {
         try {
-            currentFileHashRef.current = fileHash;
+            console.log(`🚀 initializeSender → target=${targetId} hash=${fileHash}`);
             setStatusMessage("Initializing sender...");
-            senderICEQueueRef.current = [];
+            senderICEQueue.current = [];
             senderPCRef.current?.close();
 
             const pc = new RTCPeerConnection(rtcConfig);
             senderPCRef.current = pc;
 
             const dc = pc.createDataChannel("sharex-file-pipe", { ordered: true });
-            dataChannelRef.current = dc;
 
             dc.onopen = async () => {
-                setStatusMessage("🔒 Channel open. Sending salt and chunks...");
+                setStatusMessage("🔒 Channel open. Streaming file...");
 
-                // Send the same salt that was used to encrypt so receiver can derive key
+                // 1. Send salt first (unencrypted, exactly 16 bytes)
                 dc.send(new Uint8Array(uploadSalt));
 
+                // 2. Stream encrypted chunks from IndexedDB
                 const chunks = await db.fileChunks
-                    .where("fileHash")
-                    .equals(currentFileHashRef.current)
+                    .where("fileHash").equals(fileHash)
                     .sortBy("chunkIndex");
 
                 if (chunks.length === 0) {
-                    setStatusMessage("⚠️ No chunks found in IndexedDB. Did encryption finish?");
+                    setStatusMessage("⚠️ No chunks in DB. Did encryption finish?");
                     return;
                 }
 
                 for (let i = 0; i < chunks.length; i++) {
                     const header = new TextEncoder().encode(`CHUNK:${i}:`);
-                    const data = new Uint8Array(chunks[i].data);
-                    const packet = new Uint8Array(header.byteLength + data.byteLength);
+                    const body   = new Uint8Array(chunks[i].data);
+                    const packet = new Uint8Array(header.byteLength + body.byteLength);
                     packet.set(header, 0);
-                    packet.set(data, header.byteLength);
-                    // dc.send(packet.buffer);
-                    dc.send(packet); 
+                    packet.set(body, header.byteLength);
+                    dc.send(packet);   // send Uint8Array directly — avoids ArrayBufferLike error
                 }
 
                 dc.send("__EOF__");
-                setStatusMessage("✅ All chunks transmitted!");
+                setStatusMessage("✅ All chunks sent!");
             };
 
-            // Tag sender ICE candidates with role:'sender' so the receiver's
-            // handleIncomingSignal can route them to the correct PC
+            dc.onerror = (e) => console.error("DataChannel error:", e);
+
+            // Tag sender ICE candidates with role:'sender' so the receiver-side
+            // handleIncomingSignal routes them to the right RTCPeerConnection
             pc.onicecandidate = (e) => {
-                if (e.candidate) sendSignal({ type: 'candidate', candidate: e.candidate, role: 'sender' });
+                if (e.candidate) {
+                    sendSignalRef.current(targetId, {
+                        type: 'candidate',
+                        candidate: e.candidate,
+                        role: 'sender'
+                    });
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                console.log("Sender state:", pc.connectionState);
+                if (pc.connectionState === 'failed') setStatusMessage("❌ Connection failed.");
             };
 
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
-            sendSignal({ type: 'offer', sdp: offer.sdp });
+            sendSignalRef.current(targetId, { type: 'offer', sdp: offer.sdp });
+            setStatusMessage("📡 Offer sent. Waiting for answer...");
 
         } catch (err) {
-            console.error("Sender init error:", err);
-            setStatusMessage("Failed to initialize sender.");
+            console.error("initializeSender error:", err);
+            setStatusMessage("Failed to start sender.");
         }
-    }, [sendSignal, setStatusMessage]);
+    }, [setStatusMessage]);
+
+    // ── RECEIVER ──────────────────────────────────────────────────────────────
 
     /**
-     * RECEIVER: Accepts the SDP offer, creates an answer.
-     * First binary message on the data channel is the 16-byte salt from the sender.
-     * Uses it to derive the AES key, then decrypts all incoming CHUNK payloads on __EOF__.
+     * Called on the DOWNLOADER's machine when a SIGNAL{type:'offer'} arrives.
+     *
+     * First binary message = 16-byte salt → derive AES key.
+     * All subsequent binary messages = CHUNK packets.
+     * "__EOF__" string → sort, decrypt, set receivedChunks.
      */
     const initializeReceiver = useCallback(async (
         remoteOfferSDP: string,
         passphrase: string,
-        senderId?: string
+        senderId: string          // uploaderSocketId — reply signals go here
     ) => {
         try {
-            setStatusMessage("Assembling receiver...");
-            receiverICEQueueRef.current = [];
+            console.log(`📥 initializeReceiver ← offer from ${senderId}`);
+            setStatusMessage("Connecting to sender...");
+            receiverICEQueue.current = [];
             receiverPCRef.current?.close();
 
             const pc = new RTCPeerConnection(rtcConfig);
             receiverPCRef.current = pc;
 
-            // Tag receiver ICE candidates with role:'receiver' for routing
             pc.onicecandidate = (e) => {
-                if (e.candidate) sendSignal({ type: 'candidate', candidate: e.candidate, role: 'receiver' }, senderId);
+                if (e.candidate) {
+                    sendSignalRef.current(senderId, {
+                        type: 'candidate',
+                        candidate: e.candidate,
+                        role: 'receiver'
+                    });
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                console.log("Receiver state:", pc.connectionState);
+                if (pc.connectionState === 'connected') setStatusMessage("🔗 Connected! Receiving data...");
+                if (pc.connectionState === 'failed')    setStatusMessage("❌ Connection failed.");
             };
 
             pc.ondatachannel = (event) => {
-                dataChannelRef.current = event.channel;
-                event.channel.binaryType = "arraybuffer";
+                const ch = event.channel;
+                ch.binaryType = "arraybuffer";
 
                 let saltReceived = false;
                 let derivedKey: CryptoKey | null = null;
                 const buffer: { index: number; binary: ArrayBuffer }[] = [];
 
-                event.channel.onmessage = async (msg) => {
+                ch.onmessage = async (msg) => {
+
                     // First binary message = 16-byte salt
                     if (!saltReceived && msg.data instanceof ArrayBuffer) {
-                        const salt = new Uint8Array(msg.data);
-                        if (salt.byteLength === 16) {
-                            derivedKey = await deriveKey(passphrase, salt);
+                        const bytes = new Uint8Array(msg.data);
+                        if (bytes.byteLength === 16) {
+                            derivedKey = await deriveKey(passphrase, bytes);
                             saltReceived = true;
-                            setStatusMessage("🔑 Key derived. Receiving chunks...");
+                            setStatusMessage("🔑 Key ready. Receiving chunks...");
                             return;
                         }
                     }
 
+                    // EOF → decrypt all buffered chunks
                     if (typeof msg.data === "string" && msg.data === "__EOF__") {
                         if (!derivedKey) {
-                            setStatusMessage("❌ No decryption key — was salt received?");
+                            setStatusMessage("❌ Missing decryption key.");
                             return;
                         }
-                        setStatusMessage("📦 Transfer complete. Decrypting...");
+                        setStatusMessage(`📦 ${buffer.length} chunks received. Decrypting...`);
                         buffer.sort((a, b) => a.index - b.index);
                         try {
                             const decrypted = await Promise.all(
-                                buffer.map(async ({ binary }) => {
-                                    const view = new Uint8Array(binary);
-                                    const iv = view.slice(0, 12);          // first 12 bytes = IV
-                                    const payload = view.slice(12);        // rest = ciphertext
-                                    return await window.crypto.subtle.decrypt(
+                                buffer.map(({ binary }) => {
+                                    const v  = new Uint8Array(binary);
+                                    const iv = v.slice(0, 12);
+                                    const ct = v.slice(12);
+                                    return window.crypto.subtle.decrypt(
                                         { name: 'AES-GCM', iv },
                                         derivedKey!,
-                                        payload
+                                        ct
                                     );
                                 })
                             );
                             setReceivedChunks(decrypted);
                         } catch (err) {
-                            console.error("Decryption error:", err);
-                            setStatusMessage("❌ Decryption failed. Wrong passphrase?");
+                            console.error("Decryption failed:", err);
+                            setStatusMessage("❌ Decryption failed — wrong passphrase?");
                         }
                         return;
                     }
 
+                    // CHUNK packet
                     if (msg.data instanceof ArrayBuffer) {
                         const parsed = parseChunkPacket(msg.data);
                         if (parsed) {
                             buffer.push({ index: parsed.chunkIndex, binary: parsed.payload });
-                            setStatusMessage(`Receiving... ${buffer.length} chunks cached`);
+                            setStatusMessage(`Receiving... ${buffer.length} chunks`);
                         }
                     }
                 };
             };
 
-            // 1. Apply remote offer
-            await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: remoteOfferSDP }));
+            // Apply offer
+            await pc.setRemoteDescription(
+                new RTCSessionDescription({ type: 'offer', sdp: remoteOfferSDP })
+            );
 
-            // 2. Flush any ICE candidates that arrived before remote description was set
-            console.log(`🧹 Flushing ${receiverICEQueueRef.current.length} queued receiver candidates`);
-            for (const c of receiverICEQueueRef.current) {
+            // Flush any ICE candidates that arrived before setRemoteDescription
+            console.log(`🧹 Flushing ${receiverICEQueue.current.length} queued receiver candidates`);
+            for (const c of receiverICEQueue.current) {
                 await pc.addIceCandidate(new RTCIceCandidate(c));
             }
-            receiverICEQueueRef.current = [];
+            receiverICEQueue.current = [];
 
-            // 3. Answer
+            // Send answer
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
-            sendSignal({ type: 'answer', sdp: answer.sdp }, senderId);
+            sendSignalRef.current(senderId, { type: 'answer', sdp: answer.sdp });
+            setStatusMessage("📡 Answer sent. Establishing connection...");
 
         } catch (err) {
-            console.error("Receiver init error:", err);
-            setStatusMessage("Failed to initialize receiver.");
+            console.error("initializeReceiver error:", err);
+            setStatusMessage("Failed to connect to sender.");
         }
-    }, [sendSignal, setStatusMessage]);
+    }, [setStatusMessage]);
+
+    // ── Signal router ─────────────────────────────────────────────────────────
 
     /**
-     * Routes incoming 'answer' and 'candidate' signals to the correct PC.
+     * Routes answer/candidate signals to the correct RTCPeerConnection.
      *
-     * answer  → always goes to senderPCRef (it made the offer)
-     * candidate → routed by signal.role:
-     *     role:'receiver' means the RECEIVER sent this candidate → applies to senderPCRef
-     *     role:'sender'   means the SENDER sent this candidate  → applies to receiverPCRef
+     * answer            → senderPCRef  (sender created the offer, expects answer)
+     * candidate role:'receiver' → FROM downloader → add to senderPC
+     * candidate role:'sender'   → FROM uploader   → add to receiverPC
      *
-     * FIX: The signalingState guard on the answer path prevents the
-     * "setRemoteDescription called in wrong state: stable" error that occurred
-     * when the signal was received a second time or echoed back.
+     * The signalingState guard prevents "wrong state: stable" if a signal arrives
+     * late or is duplicated by the signaling layer.
      */
     const handleIncomingSignal = useCallback(async (signal: any) => {
         try {
             if (signal.type === 'answer') {
                 const pc = senderPCRef.current;
-                if (!pc) {
-                    console.warn("Received answer but senderPCRef is null — ignoring.");
-                    return;
-                }
-                // Guard: only apply answer in the correct signaling state
+                if (!pc) { console.warn("answer arrived but no senderPC"); return; }
                 if (pc.signalingState !== 'have-local-offer') {
-                    console.warn(`Ignoring answer — signalingState is '${pc.signalingState}', expected 'have-local-offer'`);
+                    console.warn(`Ignoring answer — signalingState='${pc.signalingState}'`);
                     return;
                 }
-                await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: signal.sdp }));
+                await pc.setRemoteDescription(
+                    new RTCSessionDescription({ type: 'answer', sdp: signal.sdp })
+                );
+                console.log("✅ Answer applied to senderPC");
 
             } else if (signal.type === 'candidate' && signal.candidate) {
-                // role:'receiver' → candidate is FROM the receiver → applies to sender's PC
-                // role:'sender'   → candidate is FROM the sender   → applies to receiver's PC
-                const isFromReceiver = signal.role === 'receiver';
-                const targetPC = isFromReceiver ? senderPCRef.current : receiverPCRef.current;
-                const queue = isFromReceiver ? senderICEQueueRef : receiverICEQueueRef;
+                const fromReceiver = signal.role === 'receiver';
+                const pc    = fromReceiver ? senderPCRef.current   : receiverPCRef.current;
+                const queue = fromReceiver ? senderICEQueue         : receiverICEQueue;
 
-                if (!targetPC) return;
+                if (!pc) { console.warn(`No PC for candidate role=${signal.role}`); return; }
 
-                if (!targetPC.remoteDescription) {
-                    console.log(`⏳ Queuing ICE candidate (from ${signal.role ?? 'unknown'})`);
+                if (!pc.remoteDescription) {
+                    console.log(`⏳ Queuing ICE candidate (role=${signal.role})`);
                     queue.current.push(signal.candidate);
                 } else {
-                    await targetPC.addIceCandidate(new RTCIceCandidate(signal.candidate));
+                    await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
                 }
             }
         } catch (err) {
-            console.error("Signal processing error:", err);
+            console.error("handleIncomingSignal error:", err);
         }
     }, []);
 
-    useEffect(() => {
-        return () => {
-            dataChannelRef.current?.close();
-            senderPCRef.current?.close();
-            receiverPCRef.current?.close();
-        };
+    useEffect(() => () => {
+        senderPCRef.current?.close();
+        receiverPCRef.current?.close();
     }, []);
 
-    return { initializeSender, initializeReceiver, handleIncomingSignal, receivedChunks, setReceivedChunks };
+    return { initializeSender, initializeReceiver, handleIncomingSignal, receivedChunks };
 }
