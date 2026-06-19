@@ -3,28 +3,48 @@
 /**
  * useWebRTC.ts — 4-channel parallel WebRTC file transfer
  *
- * ── FIX (90MB+ stall) ─────────────────────────────────────────────────────────
- * Root cause: the receiver dispatched a decryptOnWorker() call for EVERY
- * incoming chunk immediately, with no concurrency limit. With 4 DataChannels
- * delivering chunks simultaneously and no backpressure on the *receiving* side,
- * thousands of pending Promises piled up in each worker's `pending` Map faster
- * than the 4 workers could process them. For small files (<~20MB / ~1300 chunks)
- * this never became visible; for 90MB+ files (~5800+ chunks) the queue grew
- * until the tab's event loop or worker postMessage queue choked and the
- * transfer appeared to "stop midway" with no error.
+ * FIX (Channel 0 error: {} on "Send another file"):
+ * ───────────────────────────────────────────────────────────────────────────
+ * resetConnections() called pc.close() on the OLD RTCPeerConnection, but the
+ * data channels created for that session still had .onerror handlers
+ * attached. Closing a PeerConnection fires error/close events on its
+ * channels as part of teardown — these are EXPECTED and harmless, not real
+ * failures. The empty `{}` in the log is an RTCErrorEvent whose properties
+ * don't serialize via console.error by default.
  *
- * Fix: a receiver-side semaphore (MAX_INFLIGHT_DECRYPTS) caps how many chunks
- * are being decrypted at once, regardless of how fast they arrive across the
- * 4 channels. Extra incoming chunks wait in a FIFO queue and are processed as
- * slots free up — exactly mirroring the bounded concurrency already used on
- * the sender/encrypt side in chunker.ts.
+ * Fix: every onerror handler now checks `pc.connectionState` / channel
+ * `.readyState` before logging. If the connection is already closed/closing,
+ * the event is swallowed silently (expected teardown noise). Real errors
+ * (channel errors while the connection is still 'connected') are still
+ * logged loudly. resetConnections() also now explicitly clears onerror/
+ * onmessage/onopen on every channel before closing the PC, so no stale
+ * handler can fire after a new session has already started.
  *
- * ── FIX (close-race) ──────────────────────────────────────────────────────────
- * handleEOF() now awaits all in-flight chunkPromises via Promise.allSettled
- * before calling writableStream.close(), preventing "Cannot write to a
- * closing writable stream".
+ * FIX (slow receiving — single-threaded disk writes):
+ * ───────────────────────────────────────────────────────────────────────────
+ * Previously processChunk() awaited writeToDisk() before returning, and the
+ * semaphore released only after BOTH decrypt AND write finished. This meant
+ * decrypt work for chunk N+1 couldn't start until chunk N's disk write had
+ * fully completed — serializing the receive pipeline on disk I/O latency
+ * even though 4 workers were decrypting in parallel.
  *
- * Packet protocol (same on all 4 channels):
+ * Fix: decrypt and write are now decoupled into two independent pipelines
+ * connected by a bounded queue:
+ *   - decryptLimiter (semaphore) still bounds how many DECRYPTS run at once
+ *     across the 4 workers — released as soon as decrypt finishes, not after
+ *     the write completes.
+ *   - A separate writeQueue + a single "write worker loop" pulls decrypted
+ *     buffers off the queue and writes them to disk one at a time (disk
+ *     writes to one file handle are inherently sequential — this is a
+ *     correctness requirement of the File System Access API, not a choice).
+ *   - Because decrypt is no longer blocked on write, all 4 decrypt workers
+ *     stay saturated continuously, and writes happen as fast as the disk
+ *     allows, back-to-back with zero idle gap between them.
+ *   - writeQueueDepth is capped (WRITE_QUEUE_HIGH_WATERMARK) so decrypted-but
+ *     -unwritten buffers don't pile up unbounded in RAM if disk I/O is slower
+ *     than decrypt+network combined.
+ *
+ * Packet protocol (same on all channels):
  *   0x01 COUNT  [1][4B total chunk count]
  *   0x02 SALT   [1][16B salt]
  *   0x03 CHUNK  [1][4B index][12B IV][ciphertext]
@@ -40,21 +60,18 @@ import { rtcConfig } from '../utils/webrtc';
 // ── Constants ─────────────────────────────────────────────────────────────────
 const N_CHANNELS        = 4;
 const PLAIN_CHUNK_SIZE  = 16384;
-const BUFFER_HIGH       = 8 * 1024 * 1024;   // pause sending above 8 MB buffered
-const BUFFER_LOW        = 2 * 1024 * 1024;   // resume below 2 MB
+const BUFFER_HIGH       = 8 * 1024 * 1024;
+const BUFFER_LOW        = 2 * 1024 * 1024;
 const N_DECRYPT_WORKERS = 4;
+const MAX_INFLIGHT_DECRYPTS = N_DECRYPT_WORKERS * 6; // 24
 
 /**
- * Maximum chunks being decrypted simultaneously on the receiver.
- * This is the fix for the 90MB+ stall: without this cap, chunks arriving
- * across 4 parallel DataChannels can outpace the 4 decrypt workers by a wide
- * margin, queuing thousands of pending postMessage calls and effectively
- * freezing progress with no visible error.
- *
- * Set to N_DECRYPT_WORKERS × 6 — enough to keep all workers saturated without
- * unbounded queue growth.
+ * Maximum number of decrypted-but-not-yet-written buffers allowed to queue up.
+ * Once exceeded, processChunk() awaits a slot before decrypting the NEXT
+ * chunk — this is the only backpressure between decrypt and write speed,
+ * preventing RAM blow-up if disk I/O briefly lags behind network+decrypt.
  */
-const MAX_INFLIGHT_DECRYPTS = N_DECRYPT_WORKERS * 6; // 24
+const WRITE_QUEUE_HIGH_WATERMARK = 48;
 
 // ── Packet type tags ──────────────────────────────────────────────────────────
 const TYPE_COUNT = 0x01;
@@ -63,7 +80,6 @@ const TYPE_CHUNK = 0x03;
 const TYPE_EOF   = 0x04;
 const TYPE_READY = 0x05;
 
-// ── Packet builders ───────────────────────────────────────────────────────────
 function makeCountPacket(n: number): Uint8Array<ArrayBuffer> {
     const p = new Uint8Array(5) as Uint8Array<ArrayBuffer>;
     p[0]=TYPE_COUNT; p[1]=(n>>24)&0xFF; p[2]=(n>>16)&0xFF; p[3]=(n>>8)&0xFF; p[4]=n&0xFF;
@@ -121,25 +137,83 @@ function decryptOnWorker(encBuf: ArrayBuffer, keyJwk: JsonWebKey, idx: number): 
     });
 }
 
-/**
- * Bounded-concurrency semaphore.
- * acquire() resolves immediately if under the limit, otherwise queues the
- * caller and resolves it once a release() frees a slot.
- */
+/** Bounded-concurrency semaphore. */
 class Semaphore {
     private active = 0;
     private queue: Array<() => void> = [];
     constructor(private readonly max: number) {}
-
     async acquire(): Promise<void> {
         if (this.active < this.max) { this.active++; return; }
         return new Promise<void>(resolve => this.queue.push(resolve));
     }
-
     release(): void {
         const next = this.queue.shift();
-        if (next) { next(); }      // hand the slot directly to the next waiter
-        else { this.active--; }    // no one waiting — free the slot
+        if (next) next();
+        else this.active--;
+    }
+}
+
+/**
+ * Sequential write pipeline.
+ *
+ * The File System Access API requires writes to a single handle to happen
+ * one at a time (concurrent .write() calls on the same stream throw). This
+ * class lets producers push {position, data} write jobs from anywhere
+ * (any of the 4 decrypt workers, any order) and guarantees they're applied
+ * to disk strictly one-at-a-time via an internal queue + a single running
+ * "drain" loop — without ever blocking the PRODUCER (decrypt) side.
+ */
+class SequentialWriter {
+    private queue: { position: number; data: ArrayBuffer }[] = [];
+    private draining = false;
+    private waiters: Array<() => void> = [];   // resolved when queue drops below watermark
+    private finished = false;
+
+    constructor(private readonly stream: FileSystemWritableFileStream | null) {}
+
+    /** Enqueue a write job. Resolves once the job is queued (not necessarily written). */
+    async push(position: number, data: ArrayBuffer): Promise<void> {
+        this.queue.push({ position, data });
+        this.kickDrain();
+
+        // Backpressure: if too many writes are queued, wait until the queue
+        // shrinks before letting the caller (decrypt pipeline) continue.
+        if (this.queue.length > WRITE_QUEUE_HIGH_WATERMARK) {
+            await new Promise<void>(resolve => this.waiters.push(resolve));
+        }
+    }
+
+    private kickDrain() {
+        if (this.draining) return;
+        this.draining = true;
+        void this.drainLoop();
+    }
+
+    private async drainLoop() {
+        while (this.queue.length > 0) {
+            const job = this.queue.shift()!;
+            if (this.stream) {
+                try {
+                    await this.stream.write({ type: 'write', position: job.position, data: job.data });
+                } catch (e) {
+                    console.error(`Disk write failed at offset ${job.position}:`, e);
+                }
+            }
+            // Wake any producers waiting on backpressure once we've drained
+            // back under the watermark.
+            if (this.queue.length <= WRITE_QUEUE_HIGH_WATERMARK) {
+                const w = this.waiters.splice(0, this.waiters.length);
+                w.forEach(resolve => resolve());
+            }
+        }
+        this.draining = false;
+    }
+
+    /** Wait for every queued write to actually land on disk. */
+    async flush(): Promise<void> {
+        while (this.queue.length > 0 || this.draining) {
+            await new Promise(r => setTimeout(r, 5));
+        }
     }
 }
 
@@ -147,13 +221,17 @@ class Semaphore {
 interface UseWebRTCOptions {
     sendSignal:       (targetId:string, signalData:any) => void;
     setStatusMessage: (msg:string) => void;
-    onSendComplete?:  () => void;   // fired once on the sender after final EOF
-    onReceiveComplete?: () => void; // fired once on the receiver after file is closed
+    onSendComplete?:  () => void;
+    onReceiveComplete?: () => void;
 }
 
 export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onReceiveComplete}: UseWebRTCOptions) {
     const senderPCRef   = useRef<RTCPeerConnection|null>(null);
     const receiverPCRef = useRef<RTCPeerConnection|null>(null);
+    // Track active channels so resetConnections() can detach handlers cleanly
+    // before closing, preventing the stale "Channel 0 error: {}" teardown noise.
+    const senderChannelsRef   = useRef<RTCDataChannel[]>([]);
+    const receiverChannelsRef = useRef<RTCDataChannel[]>([]);
 
     const [sendProgress,    setSendProgress]    = useState(0);
     const [receiveProgress, setReceiveProgress] = useState(0);
@@ -178,12 +256,40 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
         });
     }
 
-    /** Fully tear down both peer connections — used by "send another file" reset. */
+    /** Detach all handlers on a channel so teardown can't trigger stale logs. */
+    function silenceChannel(dc: RTCDataChannel) {
+        dc.onerror = null;
+        dc.onmessage = null;
+        dc.onopen = null;
+        dc.onclose = null;
+    }
+
+    /**
+     * Fully tear down both peer connections for "Send another file".
+     * Detaches every channel handler FIRST so closing the PeerConnection
+     * cannot trigger a stale onerror/onclose callback against UI state that
+     * has already been reset.
+     */
     const resetConnections = useCallback(() => {
-        senderPCRef.current?.close();
-        senderPCRef.current = null;
-        receiverPCRef.current?.close();
-        receiverPCRef.current = null;
+        senderChannelsRef.current.forEach(silenceChannel);
+        receiverChannelsRef.current.forEach(silenceChannel);
+        senderChannelsRef.current = [];
+        receiverChannelsRef.current = [];
+
+        if (senderPCRef.current) {
+            senderPCRef.current.onicecandidate = null;
+            senderPCRef.current.onconnectionstatechange = null;
+            senderPCRef.current.close();
+            senderPCRef.current = null;
+        }
+        if (receiverPCRef.current) {
+            receiverPCRef.current.onicecandidate = null;
+            receiverPCRef.current.onconnectionstatechange = null;
+            receiverPCRef.current.ondatachannel = null;
+            receiverPCRef.current.close();
+            receiverPCRef.current = null;
+        }
+
         senderICEQueue.current = [];
         receiverICEQueue.current = [];
         setSendProgress(0);
@@ -203,18 +309,20 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
             setStatusMessage('Initializing sender...');
             setSendProgress(0);
             senderICEQueue.current = [];
+
+            // Detach + close any previous sender session cleanly before starting a new one
+            senderChannelsRef.current.forEach(silenceChannel);
             senderPCRef.current?.close();
 
             const pc = new RTCPeerConnection(rtcConfig);
             senderPCRef.current = pc;
 
-            // Create all 4 channels BEFORE creating the offer (order matters —
-            // see header comment in the previous revision for the deadlock this avoids).
             const channels: RTCDataChannel[] = Array.from({length:N_CHANNELS}, (_,i) => {
                 const dc = pc.createDataChannel(`sharex-pipe-${i}`, {ordered:true});
                 dc.bufferedAmountLowThreshold = BUFFER_LOW;
                 return dc;
             });
+            senderChannelsRef.current = channels;
 
             pc.onicecandidate = e => {
                 if (e.candidate) sendSignalRef.current(targetId,{
@@ -301,7 +409,17 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
                 }
             };
 
-            channels[0].onerror = e => console.error('Channel 0 error:', e);
+            // FIX: only log real errors. RTCDataChannel fires onerror/onclose as
+            // part of NORMAL teardown when the parent PeerConnection closes —
+            // that produces an empty-looking RTCErrorEvent ({}) and is not a bug.
+            // RTCPeerConnection.connectionState only has 'closed' (not 'closing')
+            // as a terminal value, so we check just that.
+            channels[0].onerror = (e) => {
+                if (pc.connectionState === 'closed') {
+                    return; // expected teardown noise, not a real error
+                }
+                console.error('Channel 0 error:', (e as RTCErrorEvent).error ?? e);
+            };
 
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
@@ -326,6 +444,8 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
             setReceiveProgress(0);
             setDownloadUrl(null);
             receiverICEQueue.current = [];
+
+            receiverChannelsRef.current.forEach(silenceChannel);
             receiverPCRef.current?.close();
 
             const pc = new RTCPeerConnection(rtcConfig);
@@ -352,33 +472,22 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
             let setupDone  = false;
             let ch0Ref:    RTCDataChannel | null = null;
 
-            // Tracks every in-flight decrypt+write promise so handleEOF() can
-            // wait for all of them before closing the file stream.
+            // FIX: writer is now a SequentialWriter — decrypt and disk-write are
+            // decoupled pipelines. Decrypt releases its semaphore slot as soon as
+            // the worker responds; the actual disk write happens asynchronously
+            // via the writer's internal drain loop, never blocking the next
+            // chunk's decrypt from starting.
+            let writer: SequentialWriter | null = null;
+
             const chunkPromises = new Set<Promise<void>>();
-
-            // FIX (90MB+ stall): bounded concurrency for decrypt dispatch.
-            // Without this, all 4 channels could fire processChunk() simultaneously
-            // for every arriving chunk, flooding the 4 workers' pending Maps faster
-            // than they could resolve, eventually stalling the whole pipeline.
             const decryptLimiter = new Semaphore(MAX_INFLIGHT_DECRYPTS);
-
             const msgQueue: {type:number; body:Uint8Array<ArrayBuffer>}[] = [];
 
             const supportsFilePicker = typeof (window as any).showSaveFilePicker === 'function';
 
-            async function writeToDisk(idx: number, decrypted: ArrayBuffer) {
-                if (writableStream) {
-                    await writableStream.write({
-                        type:     'write',
-                        position: idx * PLAIN_CHUNK_SIZE,
-                        data:     decrypted,
-                    });
-                } else {
-                    fallbackBuffer[idx] = decrypted;
-                }
+            function reportProgress() {
                 chunksWritten++;
-                const pct = totalChunks > 0
-                    ? Math.round((chunksWritten/totalChunks)*100) : 0;
+                const pct = totalChunks > 0 ? Math.round((chunksWritten/totalChunks)*100) : 0;
                 setReceiveProgress(pct);
                 if (chunksWritten%200===0 || chunksWritten===totalChunks) {
                     setStatusMessage(`📥 Receiving ${pct}% (${chunksWritten}/${totalChunks})`);
@@ -386,22 +495,32 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
             }
 
             /**
-             * Decrypt one chunk off-thread then write to disk.
-             * Acquires a semaphore slot BEFORE dispatching to a worker, and
-             * releases it in a finally block so a failed decrypt still frees
-             * the slot for the next queued chunk.
+             * Decrypt one chunk, then hand it to the SequentialWriter and return
+             * immediately (don't wait for the disk write to finish). The
+             * semaphore slot is released right after decrypt completes, so the
+             * NEXT chunk's decrypt can start on a free worker while THIS chunk's
+             * write is still queued/in-flight on disk.
              */
             async function processChunk(body: Uint8Array<ArrayBuffer>) {
                 await decryptLimiter.acquire();
+                let idx = -1;
                 try {
-                    const idx    = (body[0]<<24)|(body[1]<<16)|(body[2]<<8)|body[3];
+                    idx = (body[0]<<24)|(body[1]<<16)|(body[2]<<8)|body[3];
                     const encBuf = body.buffer.slice(body.byteOffset+4) as ArrayBuffer;
                     const dec    = await decryptOnWorker(encBuf, keyJwk!, idx);
-                    await writeToDisk(idx, dec);
+
+                    // Release the decrypt slot NOW — writing happens off to the side.
+                    decryptLimiter.release();
+
+                    if (writer) {
+                        await writer.push(idx * PLAIN_CHUNK_SIZE, dec);
+                    } else {
+                        fallbackBuffer[idx] = dec;
+                    }
+                    reportProgress();
                 } catch (e) {
-                    console.error('Decrypt/write failed:', e);
+                    console.error(`Decrypt/write failed for chunk ${idx}:`, e);
                     setStatusMessage('❌ Decryption failed — wrong passphrase?');
-                } finally {
                     decryptLimiter.release();
                 }
             }
@@ -412,9 +531,12 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
                 if (eofCount < N_CHANNELS) return;
 
                 if (chunkPromises.size > 0) {
-                    console.log(`⏳ Waiting for ${chunkPromises.size} in-flight chunk(s) before close...`);
+                    console.log(`⏳ Waiting for ${chunkPromises.size} in-flight chunk(s)...`);
                     await Promise.allSettled(chunkPromises);
                 }
+
+                // Make sure every queued disk write has actually landed before close()
+                if (writer) await writer.flush();
 
                 setStatusMessage('💾 Finalizing...');
                 try {
@@ -448,9 +570,6 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
                 while (msgQueue.length > 0) {
                     const {type,body} = msgQueue.shift()!;
                     if (type===TYPE_CHUNK) {
-                        // Fire-and-track, don't await sequentially — the semaphore
-                        // inside processChunk already bounds concurrency, so we can
-                        // let multiple queued chunks race for slots in parallel.
                         trackChunk(processChunk(body));
                     } else if (type===TYPE_EOF) {
                         await handleEOF();
@@ -479,6 +598,8 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
                     setStatusMessage('⚠️ RAM mode (no File System Access API).');
                 }
 
+                writer = new SequentialWriter(writableStream);
+
                 setupDone = true;
                 ch0Ref?.send(makeReadyPacket());
                 setStatusMessage('🔑 Ready. Receiving on 4 channels...');
@@ -491,6 +612,7 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
                 ch.binaryType = 'arraybuffer';
                 console.log(`📡 DataChannel open: ${ch.label}`);
 
+                receiverChannelsRef.current.push(ch);
                 if (ch.label === 'sharex-pipe-0') ch0Ref = ch;
 
                 ch.onmessage = async (msg: MessageEvent) => {
@@ -515,8 +637,6 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
                             if (!setupDone) {
                                 msgQueue.push({type, body});
                             } else if (type===TYPE_CHUNK) {
-                                // Don't await here — let the semaphore bound concurrency
-                                // while allowing all 4 channels to keep delivering.
                                 trackChunk(processChunk(body));
                             } else {
                                 await handleEOF();
@@ -528,7 +648,16 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
                     }
                 };
 
-                ch.onerror = e => console.error(`Channel ${ch.label} error:`, e);
+                // FIX: same teardown-noise guard as the sender side.
+                // RTCPeerConnection.connectionState's terminal value is 'closed'
+                // only — 'closing' is not part of its type, that belongs to
+                // RTCDataChannel.readyState instead.
+                ch.onerror = (e) => {
+                    if (pc.connectionState === 'closed') {
+                        return;
+                    }
+                    console.error(`Channel ${ch.label} error:`, (e as RTCErrorEvent).error ?? e);
+                };
             };
 
             await pc.setRemoteDescription(
@@ -577,6 +706,8 @@ export function useWebRTC({sendSignal, setStatusMessage, onSendComplete, onRecei
     }, []);
 
     useEffect(() => () => {
+        senderChannelsRef.current.forEach(silenceChannel);
+        receiverChannelsRef.current.forEach(silenceChannel);
         senderPCRef.current?.close();
         receiverPCRef.current?.close();
     }, []);

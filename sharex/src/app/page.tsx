@@ -322,7 +322,7 @@ export default function HomePage() {
             const key = await deriveKey(passPhrase, salt);
 
             setStatusMessage(workerAvailable
-                ? '⚡ Encrypting with 4 parallel workers...'
+                ? '👾 Encrypting with 4 parallel workers...'
                 : '🔒 Encrypting (single-threaded fallback)...'
             );
 
