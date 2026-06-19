@@ -6,6 +6,8 @@ import { sliceFileIntoChunks, clearChunks } from '../utils/chunker';
 import { useSignaling } from '../hooks/useSignaling';
 import { useWebRTC } from '../hooks/useWebRTC';
 import { useToasts, ToastStack } from '../components/Toast';
+import { Navbar, TierNotice, TransferTier } from '../components/Navbar';
+import { HeavyTransferPanel } from '../components/HeavyTransferPanel';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sub-components
@@ -188,6 +190,12 @@ function useWorkerAvailable(): boolean {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function HomePage() {
+    // ── Top-level tier: Safe (encrypted, small files) vs Heavy (unencrypted, 400MB+) ──
+    const [tier, setTier]               = useState<TransferTier>('safe');
+    const [heavyMode, setHeavyMode]      = useState<'host' | 'join'>('host');
+    const [heavyLocked, setHeavyLocked]  = useState(false);
+
+    // ── Safe-mode state (unchanged from the original encrypted pipeline) ──────
     const [mode, setMode]                         = useState<'host' | 'download'>('host');
     const [file, setFile]                         = useState<File | null>(null);
     const [passPhrase, setPassPhrase]             = useState('');
@@ -216,22 +224,24 @@ export default function HomePage() {
     useEffect(() => { passPhraseRef.current       = passPhrase;       }, [passPhrase]);
     useEffect(() => { downloadPasswordRef.current = downloadPassword; }, [downloadPassword]);
 
-    // ── Reload guard — also fires a toast warning so the message is visible
-    // even on browsers that suppress the native beforeunload dialog text.
+    // ── Reload guard — covers BOTH safe-mode and heavy-mode busy states ────────
     useEffect(() => {
         const guard = (e: BeforeUnloadEvent) => {
-            if (!isTransferring && encryptPhase !== 'encrypting') return;
+            const safeBusy  = isTransferring || encryptPhase === 'encrypting';
+            const heavyBusy = heavyLocked;
+            if (!safeBusy && !heavyBusy) return;
             e.preventDefault();
             e.returnValue = 'File transfer in progress. Leaving will cancel the transfer.';
         };
         window.addEventListener('beforeunload', guard);
         return () => window.removeEventListener('beforeunload', guard);
-    }, [isTransferring, encryptPhase]);
+    }, [isTransferring, encryptPhase, heavyLocked]);
 
     // ── Lock tab-switching while busy ─────────────────────────────────────────
-    // True from the moment encryption starts (sender) or a download begins
-    // (receiver) until the transfer fully completes.
-    const tabLocked = isTransferring || encryptPhase === 'encrypting' || isProcessing;
+    // Combined lock used by the Navbar to disable Safe/Heavy tier switching —
+    // true if EITHER pipeline is mid-transfer, so the user can't abandon an
+    // active transfer by flipping tiers.
+    const tabLocked = isTransferring || encryptPhase === 'encrypting' || isProcessing || heavyLocked;
 
     function onDownloaderFound(downloaderSocketId: string) {
         const salt = uploadSaltRef.current;
@@ -258,7 +268,7 @@ export default function HomePage() {
         setStatusMessage,
         registerFile,
         lookupFile,
-        sendSignal,        // ← the real one, no longer stubbed out
+        sendSignal,        // real implementation from useSignaling
     } = useSignaling({ onSignalReceived, onDownloaderFound });
 
     const handleSendComplete = useCallback(() => {
@@ -278,7 +288,7 @@ export default function HomePage() {
         downloadUrl,
         resetConnections,
     } = useWebRTC({
-        sendSignal,                         // FIX: was a no-op stub — nothing ever transferred
+        sendSignal,
         setStatusMessage,
         onSendComplete: handleSendComplete,
         onReceiveComplete: handleReceiveComplete,
@@ -298,11 +308,7 @@ export default function HomePage() {
         return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
     }, []);
 
-    // ── Upload handler ────────────────────────────────────────────────────────
-    // FIX (90MB+ stall): encryption progress now comes from a REAL onProgress
-    // callback wired into sliceFileIntoChunks, rather than a time-based guess.
-    // This also means the UI never appears frozen — progress always reflects
-    // actual chunks landed in IndexedDB.
+    // ── Upload handler (Safe mode) ────────────────────────────────────────────
     const handleUpload = useCallback(async (e: React.FormEvent) => {
         e.preventDefault();
         if (!file || !passPhrase) { setStatusMessage('Select a file and enter a passphrase.'); return; }
@@ -369,12 +375,8 @@ export default function HomePage() {
         }
     }, [fileHashInput, downloadPassword, lookupFile, setStatusMessage, pushToast]);
 
-    // ── Send another file ─────────────────────────────────────────────────────
-    // Fully resets all transfer state AND forces a brand new WebSocket
-    // connection (new socket ID) by bumping sessionKey, which remounts
-    // useSignaling's underlying effect via the key trick in the return below.
+    // ── Send another file (Safe mode) ─────────────────────────────────────────
     const handleSendAnother = useCallback(async () => {
-        // Clean up the IndexedDB chunks for the file we just sent
         if (activeFileHashRef.current) {
             try { await clearChunks(activeFileHashRef.current); } catch { /* best effort */ }
         }
@@ -393,7 +395,6 @@ export default function HomePage() {
         uploadSaltRef.current = null;
         setStatusMessage('');
 
-        // New socket ID: remount the signaling WebSocket entirely
         setSessionKey(k => k + 1);
 
         pushToast({ type: 'info', message: 'Ready for a new transfer.', color: '#adff2f' });
@@ -406,13 +407,17 @@ export default function HomePage() {
         (mode === 'host' && sendProgress === 100) ||
         (mode === 'download' && receiveProgress === 100);
 
+    // Heavy mode's accent color is fixed amber-gold regardless of host/join,
+    // distinguishing it visually from Safe mode at a glance.
+    const headerColor = tier === 'heavy' ? '#ffcc00' : neonColor;
+
     return (
         <div key={sessionKey} className="min-h-screen flex flex-col justify-between" style={{ background: '#07070a', color: '#e2e8f0' }}>
 
             <ToastStack toasts={toasts} dismissToast={dismissToast} />
 
             <div className="fixed inset-0 pointer-events-none" style={{ zIndex: 0 }}>
-                <div style={{ position: 'absolute', top: '-10%', left: '-10%', width: '55vw', height: '55vw', borderRadius: '50%', background: `radial-gradient(circle, ${neonColor}07 0%, transparent 65%)`, transition: 'background 0.5s ease' }} />
+                <div style={{ position: 'absolute', top: '-10%', left: '-10%', width: '55vw', height: '55vw', borderRadius: '50%', background: `radial-gradient(circle, ${headerColor}07 0%, transparent 65%)`, transition: 'background 0.5s ease' }} />
                 <div style={{ position: 'absolute', bottom: '-10%', right: '-10%', width: '45vw', height: '45vw', borderRadius: '50%', background: 'radial-gradient(circle, rgba(255,255,255,0.02) 0%, transparent 60%)' }} />
             </div>
 
@@ -421,12 +426,12 @@ export default function HomePage() {
                 style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
                 <div className="flex items-center gap-3.5">
                     <div className="w-9 h-9 rounded-xl flex items-center justify-center"
-                        style={{ background: `${neonColor}15`, border: `1px solid ${neonColor}44`, transition: 'all 0.5s ease' }}>
-                        <span style={{ color: neonColor, fontSize: 15 }}>✦</span>
+                        style={{ background: `${headerColor}15`, border: `1px solid ${headerColor}44`, transition: 'all 0.5s ease' }}>
+                        <span style={{ color: headerColor, fontSize: 15 }}>✦</span>
                     </div>
                     <div>
                         <span className="font-mono font-black tracking-widest text-xl"
-                            style={{ color: '#fff', textShadow: `0 0 15px ${neonColor}44` }}>SHAREX</span>
+                            style={{ color: '#fff', textShadow: `0 0 15px ${headerColor}44` }}>SHAREX</span>
                         <div className="text-[10px] font-mono tracking-wider uppercase opacity-40">
                             P2P E2E Multi-channel Protocol
                         </div>
@@ -434,7 +439,7 @@ export default function HomePage() {
                 </div>
 
                 <div className="flex items-center gap-3">
-                    {!workerAvailable && (
+                    {!workerAvailable && tier === 'safe' && (
                         <div className="px-3 py-1 rounded-full text-[11px] font-mono font-bold uppercase tracking-wider"
                             style={{ background: 'rgba(255,51,102,0.1)', border: '1px solid rgba(255,51,102,0.3)', color: '#ff3366' }}>
                             ⚠ Cores Restricted
@@ -451,172 +456,220 @@ export default function HomePage() {
                 </div>
             </header>
 
+            {/* ── NAVBAR: Safe / Heavy tier switcher ──────────────────────────── */}
+            <Navbar tier={tier} onChangeTier={setTier} locked={tabLocked} />
+
             {/* ── MAIN ─────────────────────────────────────────────────────── */}
             <main className="relative z-10 flex-1 flex flex-col items-center justify-center px-4 py-8 max-w-4xl w-full mx-auto gap-8">
 
-                <div className="text-center flex flex-col gap-2.5">
-                    <h1 className="font-mono font-black text-4xl md:text-5xl tracking-tight leading-none"
-                        style={{ color: '#fff', textShadow: '0 0 30px rgba(255,255,255,0.05)' }}>
-                        Zero-Relay File Stream.
-                    </h1>
-                    <p className="text-xs md:text-sm font-mono opacity-40 max-w-md mx-auto">
-                        High-performance memory allocation pipelines operating over ephemeral cryptographic peer meshes.
-                    </p>
-                </div>
-
-                <ModePill mode={mode} onChange={m => { setMode(m); setStatusMessage(''); }} locked={tabLocked} />
-
-                <div className="relative w-full max-w-md rounded-2xl overflow-hidden"
-                    style={{
-                        background: 'rgba(12, 12, 16, 0.75)',
-                        backdropFilter: 'blur(16px)',
-                        border:     `1px solid ${isActive ? neonColor + '55' : 'rgba(255,255,255,0.08)'}`,
-                        boxShadow:  isActive ? `0 0 50px ${neonColor}18, 0 0 100px ${neonColor}05` : '0 20px 40px rgba(0,0,0,0.4)',
-                        transition: 'all 0.5s cubic-bezier(0.16, 1, 0.3, 1)',
-                    }}>
-
-                    <ParticleCanvas active={isActive} color={neonColor} />
-
-                    <div className="relative z-10 p-6 flex flex-col gap-5">
-
-                        <div className="flex items-center justify-between pb-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
-                            <div className="flex items-center gap-2">
-                                <div className="w-2 h-2 rounded-full"
-                                    style={{ background: neonColor, boxShadow: `0 0 10px ${neonColor}`, transition: 'all 0.5s ease' }} />
-                                <span className="text-xs font-mono font-bold tracking-widest uppercase" style={{ color: neonColor, transition: 'all 0.5s ease' }}>
-                                    {mode === 'host' ? 'I/O Upload Mode' : 'I/O Download Mode'}
-                                </span>
-                            </div>
-                            <ChannelBadge active={isTransferring} color={neonColor} />
+                {tier === 'safe' ? (
+                    <>
+                        <div className="text-center flex flex-col gap-2.5">
+                            <h1 className="font-mono font-black text-4xl md:text-5xl tracking-tight leading-none"
+                                style={{ color: '#fff', textShadow: '0 0 30px rgba(255,255,255,0.05)' }}>
+                                Zero-Relay File Stream.
+                            </h1>
+                            <p className="text-xs md:text-sm font-mono opacity-40 max-w-md mx-auto">
+                                High-performance memory allocation pipelines operating over ephemeral cryptographic peer meshes.
+                            </p>
                         </div>
 
-                        {/* ── HOST ─────────────────────────────────────────────── */}
-                        {mode === 'host' && (
-                            <>
-                                {!transferFullyDone && (
-                                    <form onSubmit={handleUpload} className="flex flex-col gap-4">
-                                        <div
-                                            className="rounded-xl p-6 flex flex-col items-center justify-center gap-2.5 cursor-pointer transition-all duration-300"
-                                            style={{ background: 'rgba(255,255,255,0.01)', border: `1px dashed ${file ? '#adff2f' : 'rgba(255,255,255,0.1)'}`, boxShadow: file ? 'inset 0 0 15px rgba(173,255,47,0.04)' : 'none' }}
-                                            onClick={() => !isProcessing && !tabLocked && document.getElementById('file-input')?.click()}
-                                            onDragOver={e => e.preventDefault()}
-                                            onDrop={e => { e.preventDefault(); if (isProcessing || tabLocked) return; const f = e.dataTransfer.files[0]; if (f) setFile(f); }}>
-                                            <input type="file" id="file-input" className="hidden"
-                                                onChange={e => setFile(e.target.files?.[0] || null)} disabled={isProcessing || tabLocked} />
+                        <TierNotice tier="safe" />
 
-                                            <div className="text-3xl filter drop-shadow-md" style={{ opacity: file ? 1 : 0.25 }}>{file ? '📦' : '📂'}</div>
-                                            <div className="text-xs font-mono text-center font-bold tracking-wide truncate max-w-xs" style={{ color: file ? '#adff2f' : 'rgba(255,255,255,0.3)' }}>
-                                                {file ? file.name : 'Drop payload file or click terminal'}
-                                            </div>
-                                            {file && (
-                                                <div className="text-[11px] font-mono opacity-40">
-                                                    {(file.size / 1024 / 1024).toFixed(2)} MB · {Math.ceil(file.size / 16384).toLocaleString()} blocks
+                        <ModePill mode={mode} onChange={m => { setMode(m); setStatusMessage(''); }} locked={tabLocked} />
+
+                        <div className="relative w-full max-w-md rounded-2xl overflow-hidden"
+                            style={{
+                                background: 'rgba(12, 12, 16, 0.75)',
+                                backdropFilter: 'blur(16px)',
+                                border:     `1px solid ${isActive ? neonColor + '55' : 'rgba(255,255,255,0.08)'}`,
+                                boxShadow:  isActive ? `0 0 50px ${neonColor}18, 0 0 100px ${neonColor}05` : '0 20px 40px rgba(0,0,0,0.4)',
+                                transition: 'all 0.5s cubic-bezier(0.16, 1, 0.3, 1)',
+                            }}>
+
+                            <ParticleCanvas active={isActive} color={neonColor} />
+
+                            <div className="relative z-10 p-6 flex flex-col gap-5">
+
+                                <div className="flex items-center justify-between pb-3" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                                    <div className="flex items-center gap-2">
+                                        <div className="w-2 h-2 rounded-full"
+                                            style={{ background: neonColor, boxShadow: `0 0 10px ${neonColor}`, transition: 'all 0.5s ease' }} />
+                                        <span className="text-xs font-mono font-bold tracking-widest uppercase" style={{ color: neonColor, transition: 'all 0.5s ease' }}>
+                                            {mode === 'host' ? 'I/O Upload Mode' : 'I/O Download Mode'}
+                                        </span>
+                                    </div>
+                                    <ChannelBadge active={isTransferring} color={neonColor} />
+                                </div>
+
+                                {/* ── HOST ─────────────────────────────────────────── */}
+                                {mode === 'host' && (
+                                    <>
+                                        {!transferFullyDone && (
+                                            <form onSubmit={handleUpload} className="flex flex-col gap-4">
+                                                <div
+                                                    className="rounded-xl p-6 flex flex-col items-center justify-center gap-2.5 cursor-pointer transition-all duration-300"
+                                                    style={{ background: 'rgba(255,255,255,0.01)', border: `1px dashed ${file ? '#adff2f' : 'rgba(255,255,255,0.1)'}`, boxShadow: file ? 'inset 0 0 15px rgba(173,255,47,0.04)' : 'none' }}
+                                                    onClick={() => !isProcessing && !tabLocked && document.getElementById('file-input')?.click()}
+                                                    onDragOver={e => e.preventDefault()}
+                                                    onDrop={e => { e.preventDefault(); if (isProcessing || tabLocked) return; const f = e.dataTransfer.files[0]; if (f) setFile(f); }}>
+                                                    <input type="file" id="file-input" className="hidden"
+                                                        onChange={e => setFile(e.target.files?.[0] || null)} disabled={isProcessing || tabLocked} />
+
+                                                    <div className="text-3xl filter drop-shadow-md" style={{ opacity: file ? 1 : 0.25 }}>{file ? '📦' : '📂'}</div>
+                                                    <div className="text-xs font-mono text-center font-bold tracking-wide truncate max-w-xs" style={{ color: file ? '#adff2f' : 'rgba(255,255,255,0.3)' }}>
+                                                        {file ? file.name : 'Drop payload file or click terminal'}
+                                                    </div>
+                                                    {file && (
+                                                        <div className="text-[11px] font-mono opacity-40">
+                                                            {(file.size / 1024 / 1024).toFixed(2)} MB · {Math.ceil(file.size / 16384).toLocaleString()} blocks
+                                                        </div>
+                                                    )}
+                                                    {file && file.size >= 400 * 1024 * 1024 && (
+                                                        <div className="text-[11px] font-mono" style={{ color: '#ffcc00' }}>
+                                                            ⚠ This file is 400MB+ — Heavy file share will be much faster
+                                                        </div>
+                                                    )}
                                                 </div>
-                                            )}
-                                        </div>
 
-                                        <NeonInput label="Channel Cipher Key" type="password"
-                                            placeholder="Set connection passphrase"
-                                            value={passPhrase} onChange={e => setPassPhrase(e.target.value)}
-                                            disabled={isProcessing || tabLocked} accentColor="#adff2f" />
+                                                <NeonInput label="Channel Cipher Key" type="password"
+                                                    placeholder="Set connection passphrase"
+                                                    value={passPhrase} onChange={e => setPassPhrase(e.target.value)}
+                                                    disabled={isProcessing || tabLocked} accentColor="#adff2f" />
 
-                                        {encryptPhase !== 'encrypting' && !fileHash && (
-                                            <NeonButton type="submit" disabled={!file || !passPhrase || isProcessing} color="#adff2f">
-                                                ⬆ Initialize Host Pipeline
-                                            </NeonButton>
+                                                {encryptPhase !== 'encrypting' && !fileHash && (
+                                                    <NeonButton type="submit" disabled={!file || !passPhrase || isProcessing} color="#adff2f">
+                                                        ⬆ Initialize Host Pipeline
+                                                    </NeonButton>
+                                                )}
+
+                                                {encryptPhase === 'encrypting' && (
+                                                    <NeonBar pct={encryptProgress} color="#adff2f"
+                                                        label={workerAvailable ? '⚡ Active Thread Encryption (4 Workers)' : '🔒 Main Thread Encryption Fallback'} />
+                                                )}
+
+                                                {fileHash && <HashBadge hash={fileHash} color="#adff2f" />}
+
+                                                {sendProgress > 0 && (
+                                                    <NeonBar pct={sendProgress} color="#adff2f" label="P2P Data Pipeline Uploading" />
+                                                )}
+                                            </form>
                                         )}
 
-                                        {encryptPhase === 'encrypting' && (
-                                            <NeonBar pct={encryptProgress} color="#adff2f"
-                                                label={workerAvailable ? '⚡ Active Thread Encryption (4 Workers)' : '🔒 Main Thread Encryption Fallback'} />
+                                        {transferFullyDone && (
+                                            <div className="flex flex-col gap-4 items-center text-center py-2">
+                                                <div className="text-3xl">🎉</div>
+                                                <p className="text-sm font-mono" style={{ color: '#adff2f' }}>
+                                                    File delivered successfully!
+                                                </p>
+                                                <NeonButton type="button" onClick={handleSendAnother} color="#adff2f">
+                                                    ↻ Send Another File
+                                                </NeonButton>
+                                            </div>
                                         )}
-
-                                        {fileHash && <HashBadge hash={fileHash} color="#adff2f" />}
-
-                                        {sendProgress > 0 && (
-                                            <NeonBar pct={sendProgress} color="#adff2f" label="P2P Data Pipeline Uploading" />
-                                        )}
-                                    </form>
+                                    </>
                                 )}
 
-                                {/* ── Send another file ─────────────────────────── */}
-                                {transferFullyDone && (
-                                    <div className="flex flex-col gap-4 items-center text-center py-2">
-                                        <div className="text-3xl">🎉</div>
-                                        <p className="text-sm font-mono" style={{ color: '#adff2f' }}>
-                                            File delivered successfully!
-                                        </p>
-                                        <NeonButton type="button" onClick={handleSendAnother} color="#adff2f">
-                                            ↻ Send Another File
-                                        </NeonButton>
-                                    </div>
+                                {/* ── DOWNLOAD ─────────────────────────────────────── */}
+                                {mode === 'download' && (
+                                    <>
+                                        {!transferFullyDone && (
+                                            <form onSubmit={handleDownload} className="flex flex-col gap-4">
+                                                <NeonInput label="Mesh Network File Hash" type="text"
+                                                    placeholder="Paste SHA-256 locator hash"
+                                                    value={fileHashInput} onChange={e => setFileHashInput(e.target.value)}
+                                                    disabled={isProcessing || isTransferring} accentColor="#ff6600"
+                                                    style={{ fontSize: 11 }} />
+
+                                                <NeonInput label="Decryption Cipher Key" type="password"
+                                                    placeholder="Enter authorization passphrase"
+                                                    value={downloadPassword} onChange={e => setDownloadPassword(e.target.value)}
+                                                    disabled={isProcessing || isTransferring} accentColor="#ff6600" />
+
+                                                {!isTransferring && !downloadUrl && (
+                                                    <NeonButton type="submit"
+                                                        disabled={isProcessing || !fileHashInput || !downloadPassword}
+                                                        color="#ff6600">
+                                                        {isProcessing ? '⠋ Resolving Peer Target...' : '⬇ Handshake & Connect'}
+                                                    </NeonButton>
+                                                )}
+
+                                                {receiveProgress > 0 && (
+                                                    <NeonBar pct={receiveProgress} color="#ff6600"
+                                                        label="Sub-channel P2P Stream Segment Ingestion" />
+                                                )}
+
+                                                {downloadUrl && (
+                                                    <a href={downloadUrl} download="shared_file"
+                                                        className="block w-full text-center py-3.5 rounded-xl font-mono font-bold text-sm tracking-widest uppercase transition-all duration-300"
+                                                        style={{ background: 'rgba(255,102,0,0.15)', border: '1px solid #ff6600', color: '#ff6600', boxShadow: '0 0 25px rgba(255,102,0,0.3)' }}>
+                                                        💾 Mount Payload to Disk
+                                                    </a>
+                                                )}
+
+                                                {receiveProgress === 100 && !downloadUrl && (
+                                                    <p className="text-xs text-center font-mono font-bold animate-pulse" style={{ color: '#adff2f' }}>
+                                                        ✅ Block verification passing. Buffered directly into storage FS.
+                                                    </p>
+                                                )}
+                                            </form>
+                                        )}
+
+                                        {transferFullyDone && (
+                                            <div className="flex flex-col gap-4 items-center text-center py-2">
+                                                <div className="text-3xl">🎉</div>
+                                                <p className="text-sm font-mono" style={{ color: '#ff6600' }}>
+                                                    File received successfully!
+                                                </p>
+                                                <NeonButton type="button" onClick={handleSendAnother} color="#ff6600">
+                                                    ↻ Receive Another File
+                                                </NeonButton>
+                                            </div>
+                                        )}
+                                    </>
                                 )}
-                            </>
-                        )}
 
-                        {/* ── DOWNLOAD ─────────────────────────────────────────── */}
-                        {mode === 'download' && (
-                            <>
-                                {!transferFullyDone && (
-                                    <form onSubmit={handleDownload} className="flex flex-col gap-4">
-                                        <NeonInput label="Mesh Network File Hash" type="text"
-                                            placeholder="Paste SHA-256 locator hash"
-                                            value={fileHashInput} onChange={e => setFileHashInput(e.target.value)}
-                                            disabled={isProcessing || isTransferring} accentColor="#ff6600"
-                                            style={{ fontSize: 11 }} />
+                                {statusMessage && <StatusLine msg={statusMessage} hostColor={neonColor} />}
 
-                                        <NeonInput label="Decryption Cipher Key" type="password"
-                                            placeholder="Enter authorization passphrase"
-                                            value={downloadPassword} onChange={e => setDownloadPassword(e.target.value)}
-                                            disabled={isProcessing || isTransferring} accentColor="#ff6600" />
+                            </div>
+                        </div>
+                    </>
+                ) : (
+                    <>
+                        {/* ── HEAVY MODE (unencrypted, 400MB+, room-code pairing) ──── */}
+                        <div className="text-center flex flex-col gap-2.5">
+                            <h1 className="font-mono font-black text-4xl md:text-5xl tracking-tight leading-none"
+                                style={{ color: '#fff', textShadow: '0 0 30px rgba(255,204,0,0.08)' }}>
+                                High-throughput room transfer.
+                            </h1>
+                            <p className="text-xs md:text-sm font-mono opacity-40 max-w-md mx-auto">
+                                Unencrypted, 4-channel parallel streaming for files over 400MB.
+                            </p>
+                        </div>
 
-                                        {!isTransferring && !downloadUrl && (
-                                            <NeonButton type="submit"
-                                                disabled={isProcessing || !fileHashInput || !downloadPassword}
-                                                color="#ff6600">
-                                                {isProcessing ? '⠋ Resolving Peer Target...' : '⬇ Handshake & Connect'}
-                                            </NeonButton>
-                                        )}
+                        <div className="flex items-center rounded-full p-1.5 gap-1.5"
+                            style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', opacity: heavyLocked ? 0.4 : 1, pointerEvents: heavyLocked ? 'none' : 'auto' }}>
+                            <button type="button" onClick={() => setHeavyMode('host')} disabled={heavyLocked}
+                                className="px-6 py-2 rounded-full text-xs font-mono font-bold tracking-widest uppercase transition-all"
+                                style={{ color: heavyMode === 'host' ? '#0a0a0f' : 'rgba(255,255,255,0.4)', background: heavyMode === 'host' ? '#ffcc00' : 'transparent' }}>
+                                Host & Send
+                            </button>
+                            <button type="button" onClick={() => setHeavyMode('join')} disabled={heavyLocked}
+                                className="px-6 py-2 rounded-full text-xs font-mono font-bold tracking-widest uppercase transition-all"
+                                style={{ color: heavyMode === 'join' ? '#0a0a0f' : 'rgba(255,255,255,0.4)', background: heavyMode === 'join' ? '#ffcc00' : 'transparent' }}>
+                                Join Room
+                            </button>
+                        </div>
 
-                                        {receiveProgress > 0 && (
-                                            <NeonBar pct={receiveProgress} color="#ff6600"
-                                                label="Sub-channel P2P Stream Segment Ingestion" />
-                                        )}
+                        <HeavyTransferPanel
+                            mode={heavyMode}
+                            locked={heavyLocked}
+                            setLocked={setHeavyLocked}
+                            pushToast={pushToast}
+                        />
+                    </>
+                )}
 
-                                        {downloadUrl && (
-                                            <a href={downloadUrl} download="shared_file"
-                                                className="block w-full text-center py-3.5 rounded-xl font-mono font-bold text-sm tracking-widest uppercase transition-all duration-300"
-                                                style={{ background: 'rgba(255,102,0,0.15)', border: '1px solid #ff6600', color: '#ff6600', boxShadow: '0 0 25px rgba(255,102,0,0.3)' }}>
-                                                💾 Mount Payload to Disk
-                                            </a>
-                                        )}
-
-                                        {receiveProgress === 100 && !downloadUrl && (
-                                            <p className="text-xs text-center font-mono font-bold animate-pulse" style={{ color: '#adff2f' }}>
-                                                ✅ Block verification passing. Buffered directly into storage FS.
-                                            </p>
-                                        )}
-                                    </form>
-                                )}
-
-                                {transferFullyDone && (
-                                    <div className="flex flex-col gap-4 items-center text-center py-2">
-                                        <div className="text-3xl">🎉</div>
-                                        <p className="text-sm font-mono" style={{ color: '#ff6600' }}>
-                                            File received successfully!
-                                        </p>
-                                        <NeonButton type="button" onClick={handleSendAnother} color="#ff6600">
-                                            ↻ Receive Another File
-                                        </NeonButton>
-                                    </div>
-                                )}
-                            </>
-                        )}
-
-                        {statusMessage && <StatusLine msg={statusMessage} hostColor={neonColor} />}
-
-                    </div>
-                </div>
             </main>
 
             {/* ── FOOTER ───────────────────────────────────────────────────── */}
@@ -632,7 +685,7 @@ export default function HomePage() {
                     <div className="flex flex-wrap justify-center items-center gap-x-6 gap-y-2">
                         {['Zero Allocation Storage Logs', 'Hardware AES Decryption', 'Multi-channel Swarms'].map(t => (
                             <span key={t} className="text-[10px] font-mono uppercase tracking-wider flex items-center gap-1.5 opacity-30">
-                                <span style={{ color: neonColor }}>✓</span> {t}
+                                <span style={{ color: headerColor }}>✓</span> {t}
                             </span>
                         ))}
                     </div>
